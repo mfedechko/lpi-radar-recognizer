@@ -1,0 +1,2 @@
+Для витягування HOG фіч
+python extract_hog.py --dataset /Users/mykola.fedechko/workspace/AI/projects/LPI-radar-recognition/dual_channel_feature_fusion/spectrograms_bin --class-part 1
