@@ -1,6 +1,9 @@
-# ✅ Повний Colab-сумісний скрипт для тренування DualChannelNet з усім функціоналом
+# This script is memory consuming since it loads all HOG data to RAM
 
-import os, zipfile, pickle, time, psutil, random
+# ✅ Повний Colab-сумісний скрипт
+# Підтримує: фільтрацію по SNR >= -6, 15 вибраних класів, побудову графіків, confusion matrix, classification report
+
+import os, zipfile, pickle, time, psutil, random, re
 import numpy as np
 import GPUtil
 from PIL import Image
@@ -12,7 +15,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import transforms
 
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
@@ -23,7 +26,7 @@ from google.cloud import storage
 client = storage.Client()
 
 # ========== Налаштування ==========
-BATCH_SIZE = 256
+BATCH_SIZE = 512
 NUM_EPOCHS = 30
 VALIDATION_SPLIT = 0.15
 RANDOM_SEED = 42
@@ -31,14 +34,16 @@ GCS_BUCKET = "mfedechko-datasets"
 PKL_NAME = "hog_features_all.pkl"
 ZIP_NAME = "spectrograms_bin.zip"
 
-modulation_labels = {
-    1: "LFM", 2: "2FSK", 3: "4FSK", 4: "8FSK", 5: "Costas", 6: "2PSK", 7: "4PSK", 8: "8PSK",
-    9: "Barker", 10: "Huffman", 11: "Frank", 12: "P1", 13: "P2", 14: "P3", 15: "P4", 16: "Px",
-    17: "ZadoffChu", 18: "T1", 19: "T2", 20: "T3", 21: "T4", 22: "NM", 23: "Noise"
-}
-class_names = ["2PSK", "4FSK", "Barker", "Costas", "Frank", "Huffman", "LFM", "P1", "P2", "P3", "P4", "T1", "T2", "T3", "T4"] for i in sorted(modulation_labels.keys())]
+MIN_TRAINED_SNR = -6
 
-# ========== Завантаження даних ==========
+# Обрані класи:
+class_names = [
+    "2PSK", "4FSK", "Barker", "Costas", "Frank",
+    "Huffman", "LFM", "P1", "P2", "P3", "P4",
+    "T1", "T2", "T3", "T4"
+]
+
+# ========== Завантаження ==========
 if not os.path.exists(ZIP_NAME):
     print("Завантаження файлу spectrograms_bin.zipююю")
     client.bucket(GCS_BUCKET).blob(ZIP_NAME).download_to_filename(ZIP_NAME)
@@ -52,7 +57,22 @@ if not os.path.exists("spectrograms_bin"):
         zip_ref.extractall("spectrograms_bin")
 
 with open(PKL_NAME, "rb") as f:
-    hog_data = pickle.load(f)
+    hog_data_raw = pickle.load(f)
+
+# 🔎 Фільтрація HOG-даних по class_names
+filtered_features, filtered_labels, filtered_filenames = [], [], []
+for feat, label, fname in zip(hog_data_raw["features"], hog_data_raw["labels"], hog_data_raw["filenames"]):
+    if label in class_names:
+        filtered_features.append(feat)
+        filtered_labels.append(label)
+        filtered_filenames.append(fname)
+
+hog_data = {
+    "features": filtered_features,
+    "labels": filtered_labels,
+    "filenames": filtered_filenames
+}
+
 hog_input_size = len(hog_data["features"][0])
 
 # ========== Dataset ==========
@@ -65,12 +85,22 @@ class DualChannelDataset(Dataset):
             fname: (torch.tensor(feat, dtype=torch.float32), self.encoder.transform([label])[0])
             for feat, label, fname in zip(hog_data["features"], hog_data["labels"], hog_data["filenames"])
         }
-        self.image_paths = [
-            (os.path.join(class_dir, fname), fname)
-            for class_dir in [os.path.join(image_root, d) for d in os.listdir(image_root) if os.path.isdir(os.path.join(image_root, d))]
-            for fname in os.listdir(class_dir)
-            if fname in self.hog_map
-        ]
+
+        self.image_paths = []
+        for class_dir in os.listdir(image_root):
+            class_path = os.path.join(image_root, class_dir)
+            if not os.path.isdir(class_path) or class_dir not in class_names:
+                continue
+            for fname in os.listdir(class_path):
+                match = re.search(r"_SNR(-?\d+)_", fname)
+                if not match or int(match.group(1)) < MIN_TRAINED_SNR:
+                    continue
+                if fname in self.hog_map:
+                    self.image_paths.append((os.path.join(class_path, fname), fname))
+
+        seen_classes = set(os.path.basename(os.path.dirname(p[0])) for p in self.image_paths)
+        print(f"✅ Завантажені класи: {sorted(seen_classes)}")
+        print(f"🖼️ Кількість зображень: {len(self.image_paths)}")
 
     def __len__(self): return len(self.image_paths)
 
@@ -81,9 +111,9 @@ class DualChannelDataset(Dataset):
         hog_feat, label = self.hog_map[fname]
         return image, hog_feat, label
 
-# ========== Model ==========
+# ========== Модель ==========
 class DualChannelNet(nn.Module):
-    def __init__(self, num_classes=23, hog_input_size=hog_input_size):
+    def __init__(self, num_classes=len(class_names), hog_input_size=hog_input_size):
         super().__init__()
         self.hog_cnn = nn.Sequential(
             nn.Conv1d(1, 8, 5), nn.BatchNorm1d(8), nn.ReLU(), nn.MaxPool1d(2), nn.Dropout(0.3),
@@ -108,7 +138,7 @@ class DualChannelNet(nn.Module):
         img = self.img_fc(self.img_cnn(x_img))
         return self.classifier(torch.cat([hog, img], dim=1))
 
-# ========== Системна інформація ==========
+# ========== Тренування ==========
 def get_system_usage():
     ram = psutil.virtual_memory().used / 1024**3
     cpu = psutil.cpu_percent()
@@ -118,7 +148,6 @@ def get_system_usage():
         return ram, cpu, gpu.memoryUsed, gpu.load * 100
     return ram, cpu, 0, 0
 
-# ========== Тренування з логами, графіками та конф. матрицею ==========
 def train_model_with_tracking():
     transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
     dataset = DualChannelDataset("spectrograms_bin", hog_data, transform)
@@ -140,7 +169,6 @@ def train_model_with_tracking():
     patience, patience_counter = 5, 0
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
 
-    print("Початок тренування")
     for epoch in range(NUM_EPOCHS):
         print(f"\n🔁 Epoch {epoch+1}/{NUM_EPOCHS}")
         model.train()
@@ -241,7 +269,7 @@ def train_model_with_tracking():
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names)
     plt.xlabel("Predicted")
     plt.ylabel("True")
-    plt.title("Confusion Matrix (Validation Set)")
+    plt.title("Confusion Matrix (Validation  Set)")
     plt.show()
 
     print("\n📋 Classification Report:\n")
